@@ -1510,7 +1510,7 @@ mod tests {
             134, 135,
         ]
         .into_iter()
-        .for_each(|v| vote_state.process_next_vote_slot(v, 4, 0));
+        .for_each(|v| vote_state.process_next_vote_slot(v, 4, 0)); //[BINGO: handler sig is 3-arg]
 
         // Create an initial vote account that is sized for the 1_14_11 version of vote state, and has only the
         // required lamports for rent exempt minimum at that size

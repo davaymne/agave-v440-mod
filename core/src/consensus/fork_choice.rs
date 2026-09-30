@@ -312,6 +312,7 @@ fn select_candidate_vote_and_reset_banks<'a>(
 // to record all possible reasons.
 fn can_vote_on_candidate_bank(
     candidate_vote_bank_slot: Slot,
+    last_logged_vote_slot: &mut Slot, //[BINGO]
     progress: &ProgressMap,
     tower: &Tower,
     failure_reasons: &mut Vec<HeaviestForkFailures>,
@@ -384,11 +385,16 @@ fn can_vote_on_candidate_bank(
         && propagation_confirmed
         && switch_fork_decision.can_vote()
     {
-        info!(
-            "voting: {} {:.1}%",
-            candidate_vote_bank_slot,
-            100.0 * fork_weight
-        );
+        //[BINGO] start
+        if candidate_vote_bank_slot != *last_logged_vote_slot {
+            info!(
+                "voting: {} {:.1}%",
+                candidate_vote_bank_slot,
+                100.0 * fork_weight
+            );
+            *last_logged_vote_slot = candidate_vote_bank_slot;
+        }
+        //[BINGO] end
         true
     } else {
         false
@@ -417,6 +423,7 @@ pub fn select_vote_and_reset_forks(
     tower: &mut Tower,
     latest_validator_votes_for_frozen_banks: &LatestValidatorVotesForFrozenBanks,
     fork_choice: &HeaviestSubtreeForkChoice,
+    last_logged_vote_slot: &mut Slot, //[BINGO]
 ) -> SelectVoteAndResetForkResult {
     // Try to vote on the actual heaviest fork. If the heaviest bank is
     // locked out or fails the threshold check, the validator will:
@@ -469,6 +476,7 @@ pub fn select_vote_and_reset_forks(
 
     if can_vote_on_candidate_bank(
         candidate_vote_bank.slot(),
+        last_logged_vote_slot, //[BINGO]
         progress,
         tower,
         &mut failure_reasons,
