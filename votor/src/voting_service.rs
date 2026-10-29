@@ -1,6 +1,6 @@
 use {
     agave_votor_messages::{
-        certificate::Certificate, consensus_message::VoteMessage,
+        certificate::Certificate, consensus_message::VoteMessage, vote::VoteType,
         wire::VersionedWireConsensusMessage,
     },
     bytes::Bytes,
@@ -12,7 +12,7 @@ use {
         validated_block_finalization::ValidatedBlockFinalizationCert,
     },
     std::{
-        collections::{BTreeMap, HashSet},
+        collections::{BTreeMap, HashSet, VecDeque},
         ops::Bound::{Excluded, Included, Unbounded},
         sync::{Arc, RwLock},
         thread::{self, Builder, JoinHandle},
@@ -64,6 +64,9 @@ pub fn votor_rate_limit_pps() -> usize {
 
 /// How often we should refresh messages from the standstill queue
 const STANDSTILL_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Delay before re-broadcasting a reward-eligible (Notarize / Skip) vote once.
+const REWARD_VOTE_RESEND_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub enum BLSOp {
@@ -207,6 +210,8 @@ impl VotingService {
         highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
     ) -> Self {
         let mut standstill_queue = StandstillRefreshQueue::default();
+        let mut resend_queue: VecDeque<(Instant, VersionedWireConsensusMessage, VoteType, Slot)> =
+            VecDeque::new();
         let thread_hdl = Builder::new()
             .name("solVotorVoteSvc".to_string())
             .spawn(move || {
@@ -219,12 +224,40 @@ impl VotingService {
                         &egress,
                     );
 
-                    let bls_op = match bls_receiver.recv_timeout(STANDSTILL_REFRESH_INTERVAL) {
+                    let now = Instant::now();
+                    while resend_queue.front().is_some_and(|(due, _, _, _)| *due <= now) {
+                        let (_, message, vote_type, slot) = resend_queue.pop_front().unwrap();
+                        if Self::broadcast_consensus_message(&message, &egress) {
+                            info!(
+                                "Queued delayed reward-vote resend for broadcast: \
+                                 type={vote_type:?} slot={slot}"
+                            );
+                        } else {
+                            warn!(
+                                "Failed to queue reward-eligible Alpenglow vote resend: \
+                                 type={vote_type:?} slot={slot}"
+                            );
+                        }
+                    }
+                    let timeout = resend_queue
+                        .front()
+                        .map(|(due, _, _, _)| due.saturating_duration_since(now))
+                        .map_or(STANDSTILL_REFRESH_INTERVAL, |wait| {
+                            wait.min(STANDSTILL_REFRESH_INTERVAL)
+                        });
+
+                    let bls_op = match bls_receiver.recv_timeout(timeout) {
                         Ok(bls_op) => bls_op,
                         Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => continue,
                     };
-                    Self::handle_bls_op(&cluster_info, bls_op, &egress, &mut standstill_queue);
+                    Self::handle_bls_op(
+                        &cluster_info,
+                        bls_op,
+                        &egress,
+                        &mut standstill_queue,
+                        &mut resend_queue,
+                    );
                 }
                 info!("AlpenglowVotingService has stopped");
             })
@@ -285,25 +318,27 @@ impl VotingService {
     fn broadcast_consensus_message(
         message: &VersionedWireConsensusMessage,
         egress: &mpsc::Sender<Bytes>,
-    ) {
+    ) -> bool {
         let buf = match wincode::serialize(message) {
             Ok(buf) => Bytes::from(buf),
             Err(err) => {
                 error!("Failed to serialize alpenglow message: {err:?}");
-                return;
+                return false;
             }
         };
 
         // Drop on full / closed channel: votor consensus tolerates loss, we
         // never want to backpressure into consensus, but will shout loudly.
         match egress.try_send(buf) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 error!("alpenglow transport egress channel full; dropping votes/certs!");
+                false
             }
             Err(TrySendError::Closed(_)) => {
                 // this is intentional - we can tear down the transport before votor.
                 warn!("alpenglow egress channel closed; must be shutting down");
+                false
             }
         }
     }
@@ -313,14 +348,31 @@ impl VotingService {
         bls_op: BLSOp,
         egress: &mpsc::Sender<Bytes>,
         standstill_queue: &mut StandstillRefreshQueue,
+        resend_queue: &mut VecDeque<(Instant, VersionedWireConsensusMessage, VoteType, Slot)>,
     ) {
         match bls_op {
             BLSOp::PushVote { vote } => {
+                let vote_type = vote.vote.get_type();
+                let slot = vote.vote.slot();
+                let resend = vote.vote.is_notarization() || vote.vote.is_skip();
                 let msg = VersionedWireConsensusMessage::new_from_vote(
                     Arc::unwrap_or_clone(vote),
                     cluster_info.my_shred_version(),
                 );
-                Self::broadcast_consensus_message(&msg, egress);
+                let queued = Self::broadcast_consensus_message(&msg, egress);
+                if queued {
+                    info!("Queued Alpenglow vote for broadcast: type={vote_type:?} slot={slot}");
+                } else {
+                    warn!("Failed to queue Alpenglow vote: type={vote_type:?} slot={slot}");
+                }
+                if resend && queued {
+                    resend_queue.push_back((
+                        Instant::now() + REWARD_VOTE_RESEND_DELAY,
+                        msg,
+                        vote_type,
+                        slot,
+                    ));
+                }
             }
             BLSOp::PushCertificates { certificates } => {
                 for certificate in certificates {
