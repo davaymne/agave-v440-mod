@@ -1,12 +1,15 @@
 use {
     agave_votor_messages::{
-        certificate::Certificate, consensus_message::VoteMessage, vote::VoteType,
+        certificate::Certificate, consensus_message::VoteMessage,
+        reward_certificate::NUM_SLOTS_FOR_REWARD, vote::VoteType,
         wire::VersionedWireConsensusMessage,
     },
+    agave_votor_transport::EgressMessage,
     bytes::Bytes,
     crossbeam_channel::{Receiver, RecvTimeoutError},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
+    solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_runtime::{
         slot_params::slot_time_feature_gates,
         validated_block_finalization::ValidatedBlockFinalizationCert,
@@ -21,10 +24,14 @@ use {
     tokio::sync::{mpsc, mpsc::error::TrySendError},
 };
 
-/// Max new packets per slot in steady state:
+/// New packets per slot in steady state, including the maximum targeted reward
+/// vote sends to one peer. Conservatively assumes the same peer receives all
+/// targeted copies for a reward-eligible vote in the slot:
 /// - Notarize + Finalize votes
 /// - NotarizeFallback + Notarize + FastFinalize + Finalize certificates
-const NEW_PACKETS_PER_SLOT: usize = 6;
+/// - One targeted send plus up to seven targeted retries
+const REWARD_VOTE_MAX_SENDS: usize = 8;
+const NEW_PACKETS_PER_SLOT: usize = 6 + REWARD_VOTE_MAX_SENDS;
 
 /// The amount of packets we should send per second from the standstill queue
 const STANDSTILL_REFRESH_BATCH_SIZE: usize = 20;
@@ -65,8 +72,26 @@ pub fn votor_rate_limit_pps() -> usize {
 /// How often we should refresh messages from the standstill queue
 const STANDSTILL_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Delay before re-broadcasting a reward-eligible (Notarize / Skip) vote once.
-const REWARD_VOTE_RESEND_DELAY: Duration = Duration::from_millis(100);
+/// Retry offsets from the original targeted send (T0).
+const REWARD_VOTE_RETRY_OFFSETS: [Duration; 7] = [
+    Duration::from_millis(10),
+    Duration::from_millis(30),
+    Duration::from_millis(70),
+    Duration::from_millis(150),
+    Duration::from_millis(310),
+    Duration::from_millis(510),
+    Duration::from_millis(710),
+];
+
+struct RewardVoteRetry {
+    due: Instant,
+    t0: Instant,
+    message: VersionedWireConsensusMessage,
+    leader: solana_pubkey::Pubkey,
+    vote_type: VoteType,
+    slot: Slot,
+    attempt: u8,
+}
 
 #[derive(Debug)]
 pub enum BLSOp {
@@ -206,12 +231,12 @@ impl VotingService {
     pub fn new(
         bls_receiver: Receiver<BLSOp>,
         cluster_info: Arc<ClusterInfo>,
-        egress: mpsc::Sender<Bytes>,
+        leader_schedule: Arc<LeaderScheduleCache>,
+        egress: mpsc::Sender<EgressMessage>,
         highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
     ) -> Self {
         let mut standstill_queue = StandstillRefreshQueue::default();
-        let mut resend_queue: VecDeque<(Instant, VersionedWireConsensusMessage, VoteType, Slot)> =
-            VecDeque::new();
+        let mut resend_queue: VecDeque<RewardVoteRetry> = VecDeque::new();
         let thread_hdl = Builder::new()
             .name("solVotorVoteSvc".to_string())
             .spawn(move || {
@@ -225,23 +250,55 @@ impl VotingService {
                     );
 
                     let now = Instant::now();
-                    while resend_queue.front().is_some_and(|(due, _, _, _)| *due <= now) {
-                        let (_, message, vote_type, slot) = resend_queue.pop_front().unwrap();
-                        if Self::broadcast_consensus_message(&message, &egress) {
+                    while resend_queue.front().is_some_and(|retry| retry.due <= now) {
+                        let retry = resend_queue.pop_front().unwrap();
+                        let queued = Self::send_targeted_consensus_message(
+                            &retry.message,
+                            retry.leader,
+                            &egress,
+                        );
+                        if queued {
                             info!(
-                                "Queued delayed reward-vote resend for broadcast: \
-                                 type={vote_type:?} slot={slot}"
+                                "Queued targeted reward-vote retry: type={:?} slot={} leader={} \
+                                 attempt={}/{}",
+                                retry.vote_type,
+                                retry.slot,
+                                retry.leader,
+                                retry.attempt,
+                                REWARD_VOTE_MAX_SENDS
                             );
                         } else {
                             warn!(
-                                "Failed to queue reward-eligible Alpenglow vote resend: \
-                                 type={vote_type:?} slot={slot}"
+                                "Failed to queue targeted reward-vote retry: type={:?} slot={} \
+                                 leader={} attempt={}/{}",
+                                retry.vote_type,
+                                retry.slot,
+                                retry.leader,
+                                retry.attempt,
+                                REWARD_VOTE_MAX_SENDS
+                            );
+                        }
+                        if usize::from(retry.attempt) < REWARD_VOTE_RETRY_OFFSETS.len() {
+                            let next_attempt = retry.attempt + 1;
+                            let next_due =
+                                retry.t0 + REWARD_VOTE_RETRY_OFFSETS[usize::from(next_attempt - 1)];
+                            Self::queue_reward_vote_retry(
+                                &mut resend_queue,
+                                RewardVoteRetry {
+                                    due: next_due,
+                                    t0: retry.t0,
+                                    message: retry.message,
+                                    leader: retry.leader,
+                                    vote_type: retry.vote_type,
+                                    slot: retry.slot,
+                                    attempt: next_attempt,
+                                },
                             );
                         }
                     }
                     let timeout = resend_queue
                         .front()
-                        .map(|(due, _, _, _)| due.saturating_duration_since(now))
+                        .map(|retry| retry.due.saturating_duration_since(now))
                         .map_or(STANDSTILL_REFRESH_INTERVAL, |wait| {
                             wait.min(STANDSTILL_REFRESH_INTERVAL)
                         });
@@ -253,6 +310,7 @@ impl VotingService {
                     };
                     Self::handle_bls_op(
                         &cluster_info,
+                        &leader_schedule,
                         bls_op,
                         &egress,
                         &mut standstill_queue,
@@ -270,7 +328,7 @@ impl VotingService {
         standstill_queue: &mut StandstillRefreshQueue,
         highest_finalized: &RwLock<Option<ValidatedBlockFinalizationCert>>,
         cluster_info: &ClusterInfo,
-        egress: &mpsc::Sender<Bytes>,
+        egress: &mpsc::Sender<EgressMessage>,
     ) {
         if !standstill_queue.should_refresh() {
             return;
@@ -317,7 +375,7 @@ impl VotingService {
     /// endpoint fans it out to every connected peer.
     fn broadcast_consensus_message(
         message: &VersionedWireConsensusMessage,
-        egress: &mpsc::Sender<Bytes>,
+        egress: &mpsc::Sender<EgressMessage>,
     ) -> bool {
         let buf = match wincode::serialize(message) {
             Ok(buf) => Bytes::from(buf),
@@ -329,7 +387,7 @@ impl VotingService {
 
         // Drop on full / closed channel: votor consensus tolerates loss, we
         // never want to backpressure into consensus, but will shout loudly.
-        match egress.try_send(buf) {
+        match egress.try_send(EgressMessage::Broadcast(buf)) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 error!("alpenglow transport egress channel full; dropping votes/certs!");
@@ -343,18 +401,53 @@ impl VotingService {
         }
     }
 
+    fn send_targeted_consensus_message(
+        message: &VersionedWireConsensusMessage,
+        leader: solana_pubkey::Pubkey,
+        egress: &mpsc::Sender<EgressMessage>,
+    ) -> bool {
+        let payload = match wincode::serialize(message) {
+            Ok(buf) => Bytes::from(buf),
+            Err(err) => {
+                error!("Failed to serialize targeted Alpenglow vote: {err:?}");
+                return false;
+            }
+        };
+        match egress.try_send(EgressMessage::Unicast { peer: leader, payload }) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                error!("alpenglow transport egress channel full; dropping targeted vote!");
+                false
+            }
+            Err(TrySendError::Closed(_)) => {
+                warn!("alpenglow egress channel closed; must be shutting down");
+                false
+            }
+        }
+    }
+
+    fn queue_reward_vote_retry(queue: &mut VecDeque<RewardVoteRetry>, retry: RewardVoteRetry) {
+        let index = queue
+            .iter()
+            .position(|queued| queued.due > retry.due)
+            .unwrap_or(queue.len());
+        queue.insert(index, retry);
+    }
+
     fn handle_bls_op(
         cluster_info: &ClusterInfo,
+        leader_schedule: &LeaderScheduleCache,
         bls_op: BLSOp,
-        egress: &mpsc::Sender<Bytes>,
+        egress: &mpsc::Sender<EgressMessage>,
         standstill_queue: &mut StandstillRefreshQueue,
-        resend_queue: &mut VecDeque<(Instant, VersionedWireConsensusMessage, VoteType, Slot)>,
+        resend_queue: &mut VecDeque<RewardVoteRetry>,
     ) {
         match bls_op {
             BLSOp::PushVote { vote } => {
                 let vote_type = vote.vote.get_type();
                 let slot = vote.vote.slot();
-                let resend = vote.vote.is_notarization() || vote.vote.is_skip();
+                let reward_eligible = vote.vote.is_notarization() || vote.vote.is_skip();
+                let t0 = Instant::now();
                 let msg = VersionedWireConsensusMessage::new_from_vote(
                     Arc::unwrap_or_clone(vote),
                     cluster_info.my_shred_version(),
@@ -365,13 +458,55 @@ impl VotingService {
                 } else {
                     warn!("Failed to queue Alpenglow vote: type={vote_type:?} slot={slot}");
                 }
-                if resend && queued {
-                    resend_queue.push_back((
-                        Instant::now() + REWARD_VOTE_RESEND_DELAY,
-                        msg,
-                        vote_type,
-                        slot,
-                    ));
+                if reward_eligible {
+                    let reward_slot = slot.saturating_add(NUM_SLOTS_FOR_REWARD);
+                    match leader_schedule.slot_leader_at(reward_slot, None) {
+                        Some(reward_leader) if reward_leader.id != cluster_info.id() => {
+                            let target_queued = Self::send_targeted_consensus_message(
+                                &msg,
+                                reward_leader.id,
+                                egress,
+                            );
+                            if target_queued {
+                                info!(
+                                    "Queued targeted reward-vote send: type={vote_type:?} \
+                                     slot={slot} leader={} attempt=0/{REWARD_VOTE_MAX_SENDS}",
+                                    reward_leader.id
+                                );
+                            } else {
+                                warn!(
+                                    "Failed to queue targeted reward-vote send: type={vote_type:?} \
+                                     slot={slot} leader={} attempt=0/{REWARD_VOTE_MAX_SENDS}",
+                                    reward_leader.id
+                                );
+                            }
+                            Self::queue_reward_vote_retry(
+                                resend_queue,
+                                RewardVoteRetry {
+                                    due: t0 + REWARD_VOTE_RETRY_OFFSETS[0],
+                                    t0,
+                                    message: msg,
+                                    leader: reward_leader.id,
+                                    vote_type,
+                                    slot,
+                                    attempt: 1,
+                                },
+                            );
+                        }
+                        Some(reward_leader) => {
+                            debug!(
+                                "Skipping targeted reward-vote send to self: type={vote_type:?} \
+                                 slot={slot} leader={}",
+                                reward_leader.id
+                            );
+                        }
+                        None => {
+                            warn!(
+                                "Cannot target reward vote: no leader schedule entry for slot \
+                                 {reward_slot} (vote type={vote_type:?}, slot={slot})"
+                            );
+                        }
+                    }
                 }
             }
             BLSOp::PushCertificates { certificates } => {
@@ -423,7 +558,7 @@ mod tests {
             wire::get_vote_payload_to_sign,
         },
         agave_votor_transport::{
-            PeerList, PeerListReceiver, PeerListSender,
+            EgressMessage, PeerList, PeerListReceiver, PeerListSender,
             endpoint::{Datagram, QuicDatagramEndpoint},
         },
         arc_swap::ArcSwap,
@@ -504,15 +639,24 @@ mod tests {
     fn test_rate_limit_pps_for_slot_duration() {
         assert_eq!(
             rate_limit_pps_for_slot_duration(Duration::from_millis(100)),
-            80
+            160
         );
         assert_eq!(
             rate_limit_pps_for_slot_duration(Duration::from_millis(200)),
-            50
+            90
         );
         assert_eq!(
             rate_limit_pps_for_slot_duration(Duration::from_millis(400)),
-            35
+            55
+        );
+    }
+
+    #[test]
+    fn test_reward_vote_retry_offsets_from_t0() {
+        assert_eq!(REWARD_VOTE_RETRY_OFFSETS.len() + 1, REWARD_VOTE_MAX_SENDS);
+        assert_eq!(
+            REWARD_VOTE_RETRY_OFFSETS.map(|offset| offset.as_millis()),
+            [10, 30, 70, 150, 310, 510, 710]
         );
     }
 
@@ -605,7 +749,7 @@ mod tests {
         peer_list_receiver: PeerListReceiver,
     ) -> (
         QuicDatagramEndpoint,
-        mpsc::Sender<Bytes>,
+        mpsc::Sender<EgressMessage>,
         Receiver<Datagram>,
         SocketAddr,
         Runtime,
@@ -638,7 +782,7 @@ mod tests {
     fn create_voting_service(
         bls_receiver: Receiver<BLSOp>,
         spy_listener: (Pubkey, SocketAddr),
-        egress: mpsc::Sender<Bytes>,
+        egress: mpsc::Sender<EgressMessage>,
         peer_list: PeerListSender,
     ) -> (
         VotingService,
@@ -655,6 +799,7 @@ mod tests {
             vec![100; validator_keypairs.len()],
         );
         let bank0 = Bank::new_for_tests(&genesis.genesis_config);
+        let leader_schedule = Arc::new(LeaderScheduleCache::new_from_bank(&bank0));
         let bank_forks = BankForks::new_rw_arc(bank0);
         // The sending node must itself be staked, otherwise the peer_list
         // refresh publishes an empty set and never connects to the listener.
@@ -680,6 +825,7 @@ mod tests {
             VotingService::new(
                 bls_receiver,
                 cluster_info.clone(),
+                leader_schedule,
                 egress,
                 Arc::new(RwLock::new(None)),
             ),
@@ -750,7 +896,7 @@ mod tests {
         let warmup = Bytes::from_static(b"warmup");
         let warmup_deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let _ = egress.try_send(warmup.clone());
+            let _ = egress.try_send(EgressMessage::Broadcast(warmup.clone()));
             if ingress_rx.recv_timeout(Duration::from_millis(50)).is_ok() {
                 break;
             }

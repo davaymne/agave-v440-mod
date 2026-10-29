@@ -10,10 +10,18 @@ pub(crate) mod stats;
 pub(crate) mod transport;
 
 use {
+    bytes::Bytes,
     solana_pubkey::Pubkey,
     std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration},
     tokio::sync::watch,
 };
+
+/// A payload to send to every peer or one authenticated peer.
+#[derive(Debug)]
+pub enum EgressMessage {
+    Broadcast(Bytes),
+    Unicast { peer: Pubkey, payload: Bytes },
+}
 
 pub struct PeerList {
     /// Peers with whom we are interested in communicating. Inbound admission

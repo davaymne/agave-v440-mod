@@ -1,7 +1,7 @@
 //! Outbound (client) direction: we initiate, send-only.
 use {
     crate::{
-        METRICS_INTERVAL, PeerListReceiver, close_codes,
+        EgressMessage, METRICS_INTERVAL, PeerListReceiver, close_codes,
         endpoint::KeyUpdateListener,
         error::Error,
         stats::{self, ClientStats, record_client_error},
@@ -99,7 +99,7 @@ pub(crate) struct OutboundLoop {
     endpoint: Endpoint,
     local_pubkey: Pubkey,
     /// Channel for outbound messages to be broadcast
-    egress_receiver: mpsc::Receiver<Bytes>,
+    egress_receiver: mpsc::Receiver<EgressMessage>,
     key_updates: KeyUpdateListener,
     peer_list_receiver: PeerListReceiver,
     /// Per-peer send-only connection state.
@@ -116,7 +116,7 @@ impl OutboundLoop {
     pub(crate) fn new(
         endpoint: Endpoint,
         local_pubkey: Pubkey,
-        egress_receiver: mpsc::Receiver<Bytes>,
+        egress_receiver: mpsc::Receiver<EgressMessage>,
         key_updates: KeyUpdateListener,
         peer_list_receiver: PeerListReceiver,
         cancel: CancellationToken,
@@ -189,7 +189,12 @@ impl OutboundLoop {
                         error!("OutboundLoop: egress channel closed, exiting.");
                         break;
                     };
-                    self.perform_broadcast(message);
+                    match message {
+                        EgressMessage::Broadcast(payload) => self.perform_broadcast(payload),
+                        EgressMessage::Unicast { peer, payload } => {
+                            self.perform_unicast(peer, payload)
+                        }
+                    }
                 }
                 // Periodic reconcile: connect to missing peers, drop departed peers.
                 _ = reconcile_timer.tick() => self.reconcile(),
@@ -370,6 +375,56 @@ impl OutboundLoop {
         self.stats.datagrams_sent.fetch_add(sent, Ordering::Relaxed);
         for peer in dead_peers {
             self.peer_state.remove(&peer);
+        }
+    }
+
+    /// Send one message to a single live connection.
+    fn perform_unicast(&mut self, peer: Pubkey, message: Bytes) {
+        let send_result = match self.peer_state.get(&peer) {
+            Some(PeerState::Established { connection, .. }) => {
+                Some(connection.send_datagram(message.clone()))
+            }
+            _ => None,
+        };
+
+        let Some(send_result) = send_result else {
+            if matches!(self.peer_state.get(&peer), Some(PeerState::Connecting)) {
+                warn!(
+                    "Dropping targeted datagram for {peer}: outbound connection is still being established"
+                );
+            } else {
+                warn!(
+                    "Dropping targeted datagram for {peer}: no outbound connection; retrying peer reconcile"
+                );
+                self.reconcile();
+            }
+            return;
+        };
+
+        match send_result {
+            Ok(()) => {
+                self.stats.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    "Sent targeted QUIC datagram to {peer} ({} bytes)",
+                    message.len()
+                );
+            }
+            Err(SendDatagramError::ConnectionLost(reason)) => {
+                warn!("Targeted datagram to {peer} failed; connection lost: {reason}");
+                self.stats.connection_lost.fetch_add(1, Ordering::Relaxed);
+                self.peer_state.remove(&peer);
+                self.reconcile();
+            }
+            Err(e @ (SendDatagramError::UnsupportedByPeer | SendDatagramError::TooLarge)) => {
+                warn!(
+                    "Targeted datagram to {peer} refused ({} bytes): {e}",
+                    message.len()
+                );
+                self.stats.peer_config_error.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(SendDatagramError::Disabled) => {
+                unreachable!("By construction (we enable datagrams)");
+            }
         }
     }
 

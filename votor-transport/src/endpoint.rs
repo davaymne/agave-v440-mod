@@ -83,7 +83,7 @@ impl QuicDatagramEndpoint {
         socket_addr_space: SocketAddrSpace,
         max_datagrams_per_second_per_peer: usize,
         cancel: CancellationToken,
-    ) -> Result<(mpsc::Sender<Bytes>, Self), Error> {
+    ) -> Result<(mpsc::Sender<crate::EgressMessage>, Self), Error> {
         assert!(!inbound_sockets.is_empty(), "Must have sockets provided");
         assert!(
             inbound_sockets.len() <= MAX_ENDPOINTS,
@@ -433,7 +433,7 @@ mod tests {
 
     struct Node {
         endpoint: QuicDatagramEndpoint,
-        egress: mpsc::Sender<Bytes>,
+        egress: mpsc::Sender<crate::EgressMessage>,
         ingress_receiver: Receiver<Datagram>,
         addr: SocketAddr,
         keypair: Keypair,
@@ -449,7 +449,7 @@ mod tests {
         /// Broadcast `payload` to every peer in this node's peer_list.
         fn send(&self, payload: &Bytes) {
             self.egress
-                .try_send(payload.clone())
+                .try_send(crate::EgressMessage::Broadcast(payload.clone()))
                 .expect("This channel must never overflow");
         }
 
@@ -644,6 +644,63 @@ mod tests {
             (d.peer_pubkey == pubkey_b && d.message == from_b).then_some(())
         })
         .expect("A never received B's datagram");
+    }
+
+    #[test]
+    fn test_unicast_reaches_only_target_peer() {
+        let rt = make_runtime_for_tests();
+        let keypair_a = Keypair::new();
+        let keypair_b = Keypair::new();
+        let keypair_c = Keypair::new();
+        let pubkey_a = keypair_a.pubkey();
+        let pubkey_b = keypair_b.pubkey();
+        let node_a = Node::spawn_node(&rt, keypair_a, HashMap::new(), HIGH_PPS);
+        let node_b = Node::spawn_node(&rt, keypair_b, HashMap::new(), HIGH_PPS);
+        let node_c = Node::spawn_node(&rt, keypair_c, HashMap::new(), HIGH_PPS);
+        node_a.set_peer_list(
+            [
+                (pubkey_b, Some(node_b.addr)),
+                (node_c.pubkey(), Some(node_c.addr)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        node_b.set_peer_list(peer_list_of(pubkey_a, node_a.addr));
+        node_c.set_peer_list(peer_list_of(pubkey_a, node_a.addr));
+
+        let warmup = Bytes::from_static(b"unicast-warmup");
+        send_until_received(&node_a, &warmup, &node_b.ingress_receiver, |datagram| {
+            (datagram.message == warmup).then_some(())
+        })
+        .expect("B never received A's warmup datagram");
+        send_until_received(&node_a, &warmup, &node_c.ingress_receiver, |datagram| {
+            (datagram.message == warmup).then_some(())
+        })
+        .expect("C never received A's warmup datagram");
+        drain_backlog(&node_b.ingress_receiver);
+        drain_backlog(&node_c.ingress_receiver);
+
+        let targeted = Bytes::from_static(b"targeted-only-to-B");
+        node_a
+            .egress
+            .try_send(crate::EgressMessage::Unicast {
+                peer: pubkey_b,
+                payload: targeted.clone(),
+            })
+            .expect("queue targeted datagram");
+        let received = node_b
+            .ingress_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("B never received targeted datagram");
+        assert_eq!(received.peer_pubkey, pubkey_a);
+        assert_eq!(received.message, targeted);
+        assert!(
+            node_c
+                .ingress_receiver
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "C received a datagram targeted to B"
+        );
     }
 
     /// A peer in the server's peer_list is admitted; one that is not is rejected

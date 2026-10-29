@@ -633,6 +633,7 @@ impl Tvu {
         let bls_voting_service = BLSVotingService::new(
             bls_receiver,
             cluster_info.clone(),
+            leader_schedule_cache.clone(),
             votor_egress,
             highest_finalized,
         );
